@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="健身打卡">
+<meta name="theme-color" content="#185FA5">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="css/style.css">
+<title>健身打卡</title>
+</head>
+<body>
+
+<!-- Timer overlay -->
+<div class="timer-overlay" id="timerOverlay">
+  <div class="timer-box">
+    <div class="timer-label">组间休息</div>
+    <div class="timer-ring">
+      <svg width="80" height="80" viewBox="0 0 80 80">
+        <circle class="timer-ring-bg" cx="40" cy="40" r="34"/>
+        <circle class="timer-ring-fill" id="timerRingFill" cx="40" cy="40" r="34"
+          stroke-dasharray="213.6" stroke-dashoffset="0"/>
+      </svg>
+    </div>
+    <div class="timer-count" id="timerCount">90</div>
+    <div class="timer-next" id="timerNext"></div>
+    <div class="timer-btn-row">
+      <div class="timer-btn" onclick="skipTimer()">跳过</div>
+      <div class="timer-btn primary" onclick="addTime()">+30s</div>
+    </div>
+  </div>
+</div>
+
+<!-- Pages -->
+<div class="page on" id="page-home">
+  <div class="page-header">
+    <div class="page-title">训练计划</div>
+    <div class="page-sub" id="homeSubtitle">选择今天的训练</div>
+  </div>
+  <div class="day-grid" id="dayGrid"></div>
+</div>
+
+<div class="page" id="page-workout">
+  <div class="workout-header" id="workoutHeader">
+    <div class="wh-back" onclick="backToHome()">← 返回</div>
+    <div class="wh-title" id="workoutTitle"></div>
+    <div class="wh-sub" id="workoutSub"></div>
+    <div class="wh-progress">
+      <div class="wh-prog-bar"><div class="wh-prog-fill" id="progFill" style="width:0%"></div></div>
+      <div class="wh-prog-text" id="progText"></div>
+    </div>
+  </div>
+  <div id="workoutBody"></div>
+  <div class="complete-banner" id="completeBanner">
+    <div class="cb-emoji">🎉</div>
+    <div class="cb-title">今日训练完成！</div>
+    <div class="cb-sub" id="completeSub"></div>
+  </div>
+</div>
+
+<div class="page" id="page-history">
+  <div class="page-header">
+    <div class="page-title">训练记录</div>
+    <div class="page-sub">坚持是最好的训练</div>
+  </div>
+  <div class="history-wrap" id="historyWrap"></div>
+</div>
+
+<div class="page" id="page-settings">
+  <div class="page-header">
+    <div class="page-title">设置</div>
+    <div class="page-sub">个性化你的训练体验</div>
+  </div>
+  <div class="settings-wrap">
+    <div style="font-size:11px;color:var(--text3);margin-bottom:8px;">组间休息时间</div>
+    <div class="setting-card">
+      <div class="setting-row" onclick="setRestTime(60)">
+        <div><div class="sr-label">60 秒</div><div class="sr-sub">轻量 / 有氧感</div></div>
+        <div class="sr-val" id="rest60"></div>
+      </div>
+      <div class="setting-row" onclick="setRestTime(90)">
+        <div><div class="sr-label">90 秒</div><div class="sr-sub">标准辅助动作</div></div>
+        <div class="sr-val" id="rest90"></div>
+      </div>
+      <div class="setting-row" onclick="setRestTime(120)">
+        <div><div class="sr-label">120 秒</div><div class="sr-sub">中等力量动作</div></div>
+        <div class="sr-val" id="rest120"></div>
+      </div>
+      <div class="setting-row" onclick="setRestTime(180)">
+        <div><div class="sr-label">180 秒</div><div class="sr-sub">大重量主力动作</div></div>
+        <div class="sr-val" id="rest180"></div>
+      </div>
+    </div>
+    <div style="font-size:11px;color:var(--text3);margin:16px 0 8px;">其他设置</div>
+    <div class="setting-card">
+      <div class="setting-row">
+        <div><div class="sr-label">完成振动反馈</div><div class="sr-sub">打卡时震动</div></div>
+        <div class="toggle on" id="vibrateToggle" onclick="toggleVibrate()"></div>
+      </div>
+      <div class="setting-row">
+        <div><div class="sr-label">自动启动休息计时</div><div class="sr-sub">打卡后自动开始倒计时</div></div>
+        <div class="toggle on" id="autoTimerToggle" onclick="toggleAutoTimer()"></div>
+      </div>
+    </div>
+    <div style="font-size:11px;color:var(--text3);margin:16px 0 8px;">数据</div>
+    <div class="setting-card">
+      <div class="setting-row">
+        <div><div class="sr-label">训练记录</div></div>
+        <div class="sr-val" id="totalDaysVal"></div>
+      </div>
+    </div>
+    <button class="danger-btn" onclick="clearData()">清除所有训练记录</button>
+    <div style="text-align:center;font-size:10px;color:var(--text3);margin-top:20px;line-height:1.8;">
+      数据存储在本机设备中<br>使用 IndexedDB，不会被轻易清除
+    </div>
+  </div>
+</div>
+
+<!-- Bottom nav -->
+<nav class="nav">
+  <div class="nav-btn on" id="nav-home" onclick="showPage('home')">
+    <div class="nav-icon">🏠</div><div>训练</div>
+  </div>
+  <div class="nav-btn" id="nav-history" onclick="showPage('history')">
+    <div class="nav-icon">📅</div><div>记录</div>
+  </div>
+  <div class="nav-btn" id="nav-settings" onclick="showPage('settings')">
+    <div class="nav-icon">⚙️</div><div>设置</div>
+  </div>
+</nav>
+
+<script src="js/data.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
