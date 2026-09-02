@@ -1,8 +1,11 @@
 // ── STATE ──────────────────────────────────────────────────
 let currentDay = null;
 let timerInterval = null;
+let timerCompletionTimeout = null;
 let timerSeconds = 0;
 let timerTotal = 0;
+let timerEndTime = 0;
+let timerLabel = '';
 let settings = { restTime: 90, vibrate: true, autoTimer: true };
 
 // ── DB (IndexedDB) ────────────────────────────────────────
@@ -40,6 +43,15 @@ function dbPut(store, value) {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(store, 'readwrite');
     const req = tx.objectStore(store).put(value);
+    req.onsuccess = () => resolve();
+    req.onerror = e => reject(e.target.error);
+  });
+}
+
+function dbDelete(store, key) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readwrite');
+    const req = tx.objectStore(store).delete(key);
     req.onsuccess = () => resolve();
     req.onerror = e => reject(e.target.error);
   });
@@ -93,6 +105,24 @@ async function setSetDone(date, dayKey, exId, setIdx, done) {
   await dbPut('progress', { date, data: progressCache[date] });
 }
 
+function weightKey(exId) { return `${exId}_weight`; }
+
+function readExerciseWeight(prog, exId) {
+  const value = prog?.[weightKey(exId)];
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function hasRequiredWeight(prog, exId) {
+  return readExerciseWeight(prog, exId) !== null;
+}
+
+async function setExerciseWeight(date, dayKey, exId, weight) {
+  if (!progressCache[date]) progressCache[date] = {};
+  if (!progressCache[date][dayKey]) progressCache[date][dayKey] = {};
+  progressCache[date][dayKey][weightKey(exId)] = weight;
+  await dbPut('progress', { date, data: progressCache[date] });
+}
+
 // ── Settings persistence ──────────────────────────────────
 async function loadSettings() {
   const row = await dbGet('settings', 'user_settings');
@@ -104,8 +134,21 @@ async function saveSettings() {
 }
 
 // ── Helpers ───────────────────────────────────────────────
-function today() { return new Date().toISOString().slice(0, 10); }
+function localDateKey(date = new Date()) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+function dateFromLocalKey(dateKey) {
+  const [year, month, day] = dateKey.split('-').map(Number);
+  return new Date(year, month - 1, day);
+}
+
+function today() { return localDateKey(); }
 function todayWeekday() { return new Date().getDay(); }
+
+function scheduledDayKey(date) {
+  return Object.keys(DAY_WEEKDAY).find(key => DAY_WEEKDAY[key] === date.getDay()) || null;
+}
 
 // ── PROGRESS CALCULATION ──────────────────────────────────
 function calcProgress(date, dayKey) {
@@ -216,6 +259,7 @@ function renderWorkout() {
     } else if (sec.type === 'exercises') {
       for (const ex of sec.exercises) {
         const sets = prog[ex.id] || [];
+        const weight = readExerciseWeight(prog, ex.id);
         const allDone = sets.filter(Boolean).length === ex.sets;
         html += `<div class="ex-card${allDone ? ' completed' : ''}" id="card_${ex.id}">
           <div class="ex-header">
@@ -224,6 +268,16 @@ function renderWorkout() {
           </div>
           <div class="ex-tip">${ex.tip}</div>
           <div class="ex-meta">${ex.meta}</div>
+          <label class="weight-row" for="weight_${ex.id}">
+            <span class="weight-label">本次重量</span>
+            <span class="weight-control">
+              <input class="weight-input" id="weight_${ex.id}" data-weight-ex="${ex.id}"
+                type="number" min="0" step="0.5" inputmode="decimal"
+                value="${weight === null ? '' : weight}" placeholder="0">
+              <span>kg</span>
+            </span>
+          </label>
+          <div class="weight-error" id="weight_error_${ex.id}"></div>
           <div class="ex-sets">`;
         for (let s = 0; s < ex.sets; s++) {
           const done = !!sets[s];
@@ -269,6 +323,16 @@ async function toggleSet(exId, setIdx, restSecs, label) {
   const prog = getProgress(date, currentDay);
   const sets = prog[exId] || [];
   const done = !sets[setIdx];
+  if (done && !sets.some(Boolean) && !hasRequiredWeight(prog, exId)) {
+    const input = document.getElementById(`weight_${exId}`);
+    const error = document.getElementById(`weight_error_${exId}`);
+    if (error) error.textContent = '请先输入本次重量（0 表示自重）';
+    if (input) {
+      input.classList.add('invalid');
+      input.focus();
+    }
+    return;
+  }
   await setSetDone(date, currentDay, exId, setIdx, done);
   const btn = document.getElementById(`set_${exId}_${setIdx}`);
   btn.className = 'set-btn' + (done ? ' done' : '');
@@ -318,18 +382,65 @@ function checkComplete() {
 }
 
 // ── TIMER ──────────────────────────────────────────────────
-function startTimer(secs, label) {
-  timerSeconds = secs;
-  timerTotal = secs;
-  document.getElementById('timerNext').textContent = label ? `下一组：${label}` : '';
-  document.getElementById('timerOverlay').classList.add('on');
-  updateTimerDisplay();
+function remainingSeconds(endTime, now = Date.now()) {
+  return Math.max(0, Math.ceil((endTime - now) / 1000));
+}
+
+async function persistActiveTimer() {
+  await dbPut('settings', {
+    key: 'active_timer',
+    value: { endTime: timerEndTime, total: timerTotal, label: timerLabel }
+  });
+}
+
+async function clearActiveTimer() {
+  await dbDelete('settings', 'active_timer');
+}
+
+function beginTimerTicks() {
   clearInterval(timerInterval);
-  timerInterval = setInterval(() => {
-    timerSeconds--;
-    if (timerSeconds <= 0) { skipTimer(); return; }
-    updateTimerDisplay();
-  }, 1000);
+  timerInterval = setInterval(reconcileTimer, 250);
+}
+
+function clearTimerCompletionCue() {
+  clearTimeout(timerCompletionTimeout);
+  timerCompletionTimeout = null;
+  document.getElementById('timerOverlay').classList.remove('complete');
+}
+
+function showTimerCompletionCue() {
+  clearTimerCompletionCue();
+  const overlay = document.getElementById('timerOverlay');
+  overlay.classList.add('on', 'complete');
+  document.getElementById('timerCount').textContent = '✓';
+  document.getElementById('timerNext').textContent = '休息结束，可以开始下一组';
+  document.getElementById('timerRingFill').style.strokeDashoffset = 0;
+  timerCompletionTimeout = setTimeout(() => {
+    overlay.classList.remove('on', 'complete');
+    timerCompletionTimeout = null;
+  }, 1800);
+}
+
+function startTimer(secs, label) {
+  clearTimerCompletionCue();
+  timerTotal = secs;
+  timerEndTime = Date.now() + secs * 1000;
+  timerLabel = label || '';
+  document.getElementById('timerNext').textContent = timerLabel ? `下一组：${timerLabel}` : '';
+  document.getElementById('timerOverlay').classList.add('on');
+  reconcileTimer();
+  beginTimerTicks();
+  persistActiveTimer().catch(() => {});
+}
+
+function reconcileTimer() {
+  if (!timerEndTime) return;
+  timerSeconds = remainingSeconds(timerEndTime);
+  if (timerSeconds <= 0) {
+    finishTimer(true);
+    return;
+  }
+  updateTimerDisplay();
 }
 
 function updateTimerDisplay() {
@@ -342,36 +453,81 @@ function updateTimerDisplay() {
   document.getElementById('timerRingFill').style.strokeDashoffset = offset;
 }
 
-function skipTimer() {
+function finishTimer(notify) {
   clearInterval(timerInterval);
-  document.getElementById('timerOverlay').classList.remove('on');
-  if (settings.vibrate && navigator.vibrate) navigator.vibrate(60);
+  timerInterval = null;
+  timerEndTime = 0;
+  timerSeconds = 0;
+  clearActiveTimer().catch(() => {});
+  if (notify) {
+    showTimerCompletionCue();
+    if (settings.vibrate && navigator.vibrate) navigator.vibrate([100, 80, 180]);
+  } else {
+    clearTimerCompletionCue();
+    document.getElementById('timerOverlay').classList.remove('on');
+  }
 }
 
+function skipTimer() { finishTimer(false); }
+
 function addTime() {
-  timerSeconds += 30;
-  timerTotal = Math.max(timerTotal, timerSeconds);
-  updateTimerDisplay();
+  if (!timerEndTime) return;
+  timerEndTime += 30000;
+  timerTotal += 30;
+  reconcileTimer();
+  persistActiveTimer().catch(() => {});
+}
+
+async function restoreActiveTimer() {
+  const row = await dbGet('settings', 'active_timer');
+  if (!row?.value?.endTime) return;
+  timerEndTime = Number(row.value.endTime);
+  timerTotal = Math.max(1, Number(row.value.total) || remainingSeconds(timerEndTime));
+  timerLabel = row.value.label || '';
+  document.getElementById('timerNext').textContent = timerLabel ? `下一组：${timerLabel}` : '';
+  if (remainingSeconds(timerEndTime) <= 0) {
+    finishTimer(true);
+    return;
+  }
+  document.getElementById('timerOverlay').classList.add('on');
+  reconcileTimer();
+  beginTimerTicks();
 }
 
 // ── HISTORY ────────────────────────────────────────────────
+function completedTrainingDates() {
+  return Object.keys(progressCache).filter(date =>
+    DAY_KEYS.some(key => isDayComplete(date, key))
+  );
+}
+
+function calculateScheduledStreak(now = new Date(), isComplete = isDayComplete, planForDate = scheduledDayKey) {
+  const cursor = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const todayPlan = planForDate(cursor);
+  if (!todayPlan || !isComplete(localDateKey(cursor), todayPlan)) {
+    cursor.setDate(cursor.getDate() - 1);
+  }
+
+  let streak = 0;
+  for (let checked = 0; checked < 3660; checked++) {
+    const expectedPlan = planForDate(cursor);
+    if (!expectedPlan) {
+      cursor.setDate(cursor.getDate() - 1);
+      continue;
+    }
+    if (!isComplete(localDateKey(cursor), expectedPlan)) break;
+    streak++;
+    cursor.setDate(cursor.getDate() - 1);
+  }
+  return streak;
+}
+
 function renderHistory() {
   const p = progressCache;
   const wrap = document.getElementById('historyWrap');
   const allDates = Object.keys(p).sort().reverse();
-  const totalDays = allDates.filter(d =>
-    DAY_KEYS.some(k => p[d][k] && isDayComplete(d, k))
-  ).length;
-
-  let streak = 0;
-  const dt = new Date(); dt.setHours(0, 0, 0, 0);
-  for (let i = 0; i < 365; i++) {
-    const ds = dt.toISOString().slice(0, 10);
-    const hasTrain = DAY_KEYS.some(k => p[ds]?.[k] && isDayComplete(ds, k));
-    if (hasTrain) streak++;
-    else if (i > 0) break;
-    dt.setDate(dt.getDate() - 1);
-  }
+  const totalDays = completedTrainingDates().length;
+  const streak = calculateScheduledStreak();
 
   const now = new Date();
   const yr = now.getFullYear(), mo = now.getMonth();
@@ -382,7 +538,7 @@ function renderHistory() {
 
   let calHtml = `<div class="stats-grid">
     <div class="stat-card"><div class="stat-num">${totalDays}</div><div class="stat-lbl">累计训练天数</div></div>
-    <div class="stat-card"><div class="stat-num">${streak}</div><div class="stat-lbl">当前连续天数</div></div>
+    <div class="stat-card"><div class="stat-num">${streak}</div><div class="stat-lbl">当前连续训练日</div></div>
   </div>
   <div class="cal-month">${yr}年 ${months[mo]}</div>
   <div class="cal-grid">
@@ -395,11 +551,16 @@ function renderHistory() {
     const isToday = ds === today();
     const hasFull = DAY_KEYS.some(k => isDayComplete(ds, k));
     const hasPartial = !hasFull && DAY_KEYS.some(k => p[ds]?.[k] && Object.keys(p[ds][k]).length > 0);
+    const wasMissed = ds < today() && !!scheduledDayKey(dateFromLocalKey(ds)) && !hasFull && !hasPartial;
     let cls = 'cal-day';
     if (isToday) cls += ' today';
-    else if (hasFull) cls += ' done';
+    if (hasFull) cls += ' done';
     else if (hasPartial) cls += ' partial';
-    calHtml += `<div class="${cls}">${d}</div>`;
+    else if (wasMissed) cls += ' missed';
+    const mark = hasFull ? '<span class="cal-mark">✓</span>'
+      : hasPartial ? '<span class="cal-mark">•</span>'
+      : wasMissed ? '<span class="cal-mark">✕</span>' : '';
+    calHtml += `<div class="${cls}"><span class="cal-date">${d}</span>${mark}</div>`;
   }
   calHtml += '</div>';
 
@@ -413,12 +574,19 @@ function renderHistory() {
       const dateLabel = `${parts[1]}月${parts[2]}日`;
       const completedDays = DAY_KEYS.filter(k => isDayComplete(d, k));
       const names = completedDays.map(k => PLAN[k].label + ' ' + PLAN[k].title).join('、');
+      const weights = completedDays.flatMap(k =>
+        PLAN[k].sections.flatMap(section => section.exercises || []).map(ex => {
+          const weight = readExerciseWeight(getProgress(d, k), ex.id);
+          return weight === null ? null : `${ex.name} ${weight}kg`;
+        }).filter(Boolean)
+      );
       listHtml += `<div class="history-item">
         <div class="hi-top">
           <div class="hi-date">${dateLabel}</div>
           <div class="hi-day">${completedDays.map(k => PLAN[k].label).join(' ')}</div>
         </div>
         <div class="hi-exs">${names}</div>
+        ${weights.length ? `<div class="hi-weights">${weights.join('·')}</div>` : ''}
       </div>`;
     });
   }
@@ -434,9 +602,7 @@ function renderSettings() {
   });
   document.getElementById('vibrateToggle').className = 'toggle' + (settings.vibrate ? ' on' : '');
   document.getElementById('autoTimerToggle').className = 'toggle' + (settings.autoTimer ? ' on' : '');
-  const totalDays = Object.keys(progressCache).filter(d =>
-    DAY_KEYS.some(k => isDayComplete(d, k))
-  ).length;
+  const totalDays = completedTrainingDates().length;
   document.getElementById('totalDaysVal').textContent = totalDays + ' 天';
 }
 
@@ -465,6 +631,7 @@ async function init() {
   await loadAllProgress();
   await loadSettings();
   renderHome();
+  await restoreActiveTimer();
 
   // Event delegation for workout items
   document.getElementById('workoutBody').addEventListener('click', e => {
@@ -486,10 +653,41 @@ async function init() {
     }
   });
 
+  document.getElementById('workoutBody').addEventListener('change', async e => {
+    const input = e.target.closest('[data-weight-ex]');
+    if (!input) return;
+    const value = Number(input.value);
+    const error = document.getElementById(`weight_error_${input.dataset.weightEx}`);
+    if (input.value.trim() === '' || !Number.isFinite(value) || value < 0) {
+      input.classList.add('invalid');
+      if (error) error.textContent = '请输入 0 或更大的重量';
+      return;
+    }
+    input.classList.remove('invalid');
+    if (error) error.textContent = '';
+    await setExerciseWeight(today(), currentDay, input.dataset.weightEx, value);
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') reconcileTimer();
+  });
+  window.addEventListener('pageshow', reconcileTimer);
+
   // Register service worker
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('./sw.js').catch(() => {});
   }
 }
 
-init();
+if (typeof document !== 'undefined') init();
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    localDateKey,
+    dateFromLocalKey,
+    remainingSeconds,
+    readExerciseWeight,
+    hasRequiredWeight,
+    calculateScheduledStreak
+  };
+}
