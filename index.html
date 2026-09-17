@@ -35,12 +35,26 @@
 </div>
 
 <!-- Exercise progress chart -->
-<div class="chart-modal" id="chartModal" role="dialog" aria-modal="true" aria-label="动作变化图">
+<div class="chart-modal" id="chartModal" role="dialog" aria-modal="true" aria-label="动作月度平均重量趋势图">
   <div class="chart-modal-box">
     <button class="chart-close" type="button" onclick="closeExerciseChart()" aria-label="关闭">×</button>
     <div id="chartModalBody"></div>
   </div>
 </div>
+
+<!-- Workout completion celebration -->
+<dialog class="completion-dialog" id="completionDialog"
+  aria-labelledby="completionTitle" aria-describedby="completionDescription">
+  <div class="completion-dialog-content">
+    <div class="completion-icon" aria-hidden="true">🎉</div>
+    <h2 class="completion-title" id="completionTitle">恭喜完成今天的全部训练</h2>
+    <p class="completion-description" id="completionDescription">
+      <time class="completion-date" id="completionDate" datetime=""></time>
+      <span>今天的训练已全部完成，保持这份节奏。</span>
+    </p>
+    <button class="completion-close" id="completionClose" type="button">太棒了</button>
+  </div>
+</dialog>
 
 <!-- Pages -->
 <div class="page on" id="page-home">
@@ -62,11 +76,6 @@
     </div>
   </div>
   <div id="workoutBody"></div>
-  <div class="complete-banner" id="completeBanner">
-    <div class="cb-emoji">🎉</div>
-    <div class="cb-title">今日训练完成！</div>
-    <div class="cb-sub" id="completeSub"></div>
-  </div>
 </div>
 
 <div class="page" id="page-history">

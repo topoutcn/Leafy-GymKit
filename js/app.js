@@ -6,6 +6,8 @@ let timerSeconds = 0;
 let timerTotal = 0;
 let timerEndTime = 0;
 let timerLabel = '';
+let completionReturnFocus = null;
+let exerciseChartState = null;
 let settings = { restTime: 90, vibrate: true, autoTimer: true };
 const BACKUP_FORMAT = 'Leafy-GymKit-Backup';
 const BACKUP_VERSION = 2;
@@ -168,12 +170,99 @@ function readSetLogs(prog, exId, setCount = 0) {
   const length = Math.max(setCount, Array.isArray(raw) ? raw.length : 0);
   return Array.from({ length }, (_, index) => {
     const normalized = normalizeSetLog(raw?.[index], false);
-    if (normalized) return {
-      weight: normalized.weight ?? legacyWeight,
-      actualCount: normalized.actualCount
-    };
+    if (Array.isArray(raw)) return normalized
+      ? { weight: normalized.weight, actualCount: normalized.actualCount }
+      : null;
     return legacyWeight === null ? null : { weight: legacyWeight, actualCount: null };
   });
+}
+
+function classifyFirstSetWeight(rawValue) {
+  const raw = String(rawValue ?? '').trim();
+  if (raw === '') return { kind: 'empty', weight: null };
+  const weight = Number(raw);
+  return Number.isFinite(weight) && weight >= 0 && weight <= 10000
+    ? { kind: 'valid', weight }
+    : { kind: 'invalid', weight: null };
+}
+
+function nextAutofillWeightState(state, firstWeightRaw) {
+  if (!state.autoFillEligible || state.touched || state.completed) return { ...state };
+  const first = classifyFirstSetWeight(firstWeightRaw);
+  if (first.kind === 'invalid') return { ...state };
+  if (first.kind === 'empty') {
+    return state.source === 'auto'
+      ? { ...state, value: state.fallbackValue, source: state.fallbackSource }
+      : { ...state };
+  }
+  if (!['auto', 'history', 'blank'].includes(state.source)) return { ...state };
+  return { ...state, value: first.weight, source: 'auto' };
+}
+
+function resolveSetDisplayRows(prog, exId, setCount, previousLogs = []) {
+  const raw = prog?._v2?.setLogs?.[exId];
+  const legacyWeight = readExerciseWeight(prog, exId);
+  const hasV2Logs = Array.isArray(raw);
+  const completed = Array.isArray(prog?.[exId]) ? prog[exId] : [];
+  const rows = Array.from({ length: setCount }, (_, index) => {
+    const current = normalizeSetLog(raw?.[index], false);
+    if (current) return {
+      weight: current.weight,
+      actualCount: current.actualCount,
+      weightSource: 'current-v2',
+      fallbackWeight: current.weight,
+      fallbackSource: 'current-v2',
+      autoFillEligible: false,
+      completed: !!completed[index]
+    };
+    if (!hasV2Logs && legacyWeight !== null) {
+      return {
+        weight: legacyWeight,
+        actualCount: null,
+        weightSource: 'current-legacy',
+        fallbackWeight: legacyWeight,
+        fallbackSource: 'current-legacy',
+        autoFillEligible: false,
+        completed: !!completed[index]
+      };
+    }
+    const previous = normalizeSetLog(previousLogs[index], false);
+    const weightSource = previous?.weight !== null && previous?.weight !== undefined
+      ? 'history' : 'blank';
+    const weight = previous?.weight ?? null;
+    return {
+      weight,
+      actualCount: previous?.actualCount ?? null,
+      weightSource,
+      fallbackWeight: weight,
+      fallbackSource: weightSource,
+      autoFillEligible: index > 0 && !completed[index],
+      completed: !!completed[index]
+    };
+  });
+  const firstCurrent = normalizeSetLog(raw?.[0], false);
+  const firstWeight = firstCurrent?.weight;
+  if (!Number.isFinite(firstWeight) || firstWeight < 0 || firstWeight > 10000) return rows;
+  return rows.map((row, index) => {
+    if (index === 0) return row;
+    const next = nextAutofillWeightState({
+      value: row.weight,
+      source: row.weightSource,
+      fallbackValue: row.fallbackWeight,
+      fallbackSource: row.fallbackSource,
+      autoFillEligible: row.autoFillEligible,
+      touched: false,
+      completed: row.completed
+    }, String(firstWeight));
+    return { ...row, weight: next.value, weightSource: next.source };
+  });
+}
+
+function resolveSetDisplayValues(prog, exId, setCount, previousLogs = []) {
+  return resolveSetDisplayRows(prog, exId, setCount, previousLogs).map(row => ({
+    weight: row.weight,
+    actualCount: row.actualCount
+  }));
 }
 
 async function setSetLogAndDone(date, dayKey, exId, setIdx, log, done) {
@@ -232,6 +321,11 @@ function localDateKey(date = new Date()) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 }
 
+function formatLocalChineseDate(dateKey = localDateKey()) {
+  const [year, month, day] = dateKey.split('-').map(Number);
+  return `${year}年${month}月${day}日`;
+}
+
 function dateFromLocalKey(dateKey) {
   const [year, month, day] = dateKey.split('-').map(Number);
   return new Date(year, month - 1, day);
@@ -267,10 +361,6 @@ function countUnitLabel(unit) {
   return unit === '步' ? '步数' : unit === '秒' ? '秒数' : '次数';
 }
 
-function completedSetEntries(logs) {
-  return logs.flatMap((log, index) => log ? [{ index, log }] : []);
-}
-
 function priorExerciseSessions(
   exId,
   beforeDate = today(),
@@ -290,25 +380,6 @@ function priorExerciseSessions(
   }).slice(0, limit);
 }
 
-function exerciseMetrics(logs) {
-  const completedLogs = logs.filter(log => !!log);
-  const knownWeights = completedLogs.filter(log => Number.isFinite(log.weight) && log.weight >= 0);
-  const knownCounts = completedLogs.filter(log => Number.isInteger(log.actualCount) && log.actualCount > 0);
-  const loadVolumeAvailable = completedLogs.length > 0 && completedLogs.every(log =>
-    Number.isFinite(log.weight) && log.weight > 0
-      && Number.isInteger(log.actualCount) && log.actualCount > 0
-  );
-  const totalCount = knownCounts.reduce((sum, log) => sum + log.actualCount, 0);
-  return {
-    maxWeight: knownWeights.length ? Math.max(...knownWeights.map(log => log.weight)) : 0,
-    totalCount,
-    totalReps: totalCount,
-    loadVolumeAvailable,
-    volume: loadVolumeAvailable
-      ? completedLogs.reduce((sum, log) => sum + log.weight * log.actualCount, 0) : null
-  };
-}
-
 function formatSetLog(log, countUnit = '次') {
   if (!log) return '未记录';
   const weightText = log.weight === null ? '重量未记录' : `${log.weight}kg`;
@@ -317,19 +388,127 @@ function formatSetLog(log, countUnit = '次') {
   return `${weightText} × ${countText}`;
 }
 
-function formatTrainingSummary(metrics, countUnit = '次') {
-  const countText = `总${countUnitLabel(countUnit)} ${metrics.totalCount}${countUnit}`;
-  return metrics.loadVolumeAvailable
-    ? `${countText} · 负重容量 ${metrics.volume.toFixed(1)} kg·${countUnit}`
-    : `${countText} · 负重容量不适用（自重或负重未完整记录）`;
+function normalizeYearMonth(year, month) {
+  const totalMonths = year * 12 + month;
+  const normalizedYear = Math.floor(totalMonths / 12);
+  return {
+    year: normalizedYear,
+    month: totalMonths - normalizedYear * 12
+  };
 }
 
-function exerciseChartCopy(exercise) {
-  const countLabel = countUnitLabel(exerciseCountUnit(exercise));
+function shiftYearMonth(year, month, delta) {
+  return normalizeYearMonth(year, month + delta);
+}
+
+function compareYearMonth(leftYear, leftMonth, rightYear, rightMonth) {
+  return leftYear * 12 + leftMonth - (rightYear * 12 + rightMonth);
+}
+
+function daysInMonth(year, month) {
+  const normalized = normalizeYearMonth(year, month);
+  const lengths = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  const leap = normalized.year % 4 === 0
+    && (normalized.year % 100 !== 0 || normalized.year % 400 === 0);
+  return normalized.month === 1 && leap ? 29 : lengths[normalized.month];
+}
+
+function formatChartWeight(value) {
+  return Number(value).toFixed(1).replace(/\.0$/, '');
+}
+
+function monthlyExerciseAverages(
+  exId,
+  year,
+  month,
+  cache = progressCache,
+  plan = PLAN
+) {
+  const normalized = normalizeYearMonth(year, month);
+  const ex = findExercise(exId, plan);
+  if (!ex) return [];
+  const prefix = `${normalized.year}-${String(normalized.month + 1).padStart(2, '0')}-`;
+  const monthLength = daysInMonth(normalized.year, normalized.month);
+  const points = [];
+  for (let day = 1; day <= monthLength; day++) {
+    const date = `${prefix}${String(day).padStart(2, '0')}`;
+    const prog = cache[date]?.[ex.dayKey];
+    const completed = prog?.[exId];
+    if (!Array.isArray(completed) || !completed.some(Boolean)) continue;
+    const logs = readSetLogs(prog, exId, ex.sets);
+    const weights = logs.flatMap((log, index) => completed[index]
+      && Number.isFinite(log?.weight) && log.weight >= 0 ? [log.weight] : []);
+    if (!weights.length) continue;
+    points.push({
+      date,
+      day,
+      average: weights.reduce((sum, weight) => sum + weight, 0) / weights.length,
+      weights
+    });
+  }
+  return points;
+}
+
+function monthlyChartModel(points, year, month) {
+  const width = 640;
+  const height = 250;
+  const plot = { left: 54, right: 622, top: 18, bottom: 206 };
+  const monthLength = daysInMonth(year, month);
+  const values = points.map(point => point.average);
+  let min = values.length ? Math.min(...values) : 0;
+  let max = values.length ? Math.max(...values) : 1;
+  if (min === max) {
+    if (max === 0) {
+      max = 1;
+    } else {
+      const padding = Math.max(max * 0.1, 1);
+      min = Math.max(0, min - padding);
+      max += padding;
+    }
+  } else {
+    const padding = Math.max((max - min) * 0.12, 0.5);
+    min = Math.max(0, min - padding);
+    max += padding;
+  }
+  const xForDay = day => plot.left
+    + (day - 1) / Math.max(1, monthLength - 1) * (plot.right - plot.left);
+  const yForValue = value => plot.bottom
+    - (value - min) / (max - min) * (plot.bottom - plot.top);
+  const plottedPoints = points.map(point => ({
+    ...point,
+    x: xForDay(point.day),
+    y: yForValue(point.average)
+  }));
+  const labelDays = [...new Set([1, 5, 10, 15, 20, 25, monthLength])]
+    .filter(day => day <= monthLength);
   return {
-    title: `${exercise.name} · 重量与${countLabel}变化`,
-    empty: '暂无可绘制的已完成组记录'
+    width,
+    height,
+    plot,
+    points: plottedPoints,
+    path: plottedPoints.map((point, index) => `${index ? 'L' : 'M'} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`).join(' '),
+    xLabels: labelDays.map(day => ({ day, x: xForDay(day) })),
+    yTicks: [max, (max + min) / 2, min].map(value => ({ value, y: yForValue(value) }))
   };
+}
+
+function renderMonthlyAverageChart(points, year, month) {
+  const model = monthlyChartModel(points, year, month);
+  const grid = model.yTicks.map(tick => `<g>
+    <line class="monthly-chart-grid" x1="${model.plot.left}" y1="${tick.y}" x2="${model.plot.right}" y2="${tick.y}"></line>
+    <text class="monthly-chart-y-label" x="${model.plot.left - 8}" y="${tick.y + 4}" text-anchor="end">${formatChartWeight(tick.value)}kg</text>
+  </g>`).join('');
+  const xLabels = model.xLabels.map(label => `<text class="monthly-chart-x-label" x="${label.x}" y="${model.plot.bottom + 24}" text-anchor="middle">${label.day}</text>`).join('');
+  const line = model.points.length > 1
+    ? `<path class="monthly-chart-line" d="${model.path}"></path>` : '';
+  const dots = model.points.map(point => `<circle class="monthly-chart-point" cx="${point.x}" cy="${point.y}" r="5">
+    <title>${point.date} 平均 ${formatChartWeight(point.average)}kg</title>
+  </circle>`).join('');
+  return `<svg class="monthly-load-chart" viewBox="0 0 ${model.width} ${model.height}" role="img" aria-label="${year}年${month + 1}月每日已完成组平均重量折线图">
+    ${grid}
+    <line class="monthly-chart-axis" x1="${model.plot.left}" y1="${model.plot.bottom}" x2="${model.plot.right}" y2="${model.plot.bottom}"></line>
+    ${xLabels}${line}${dots}
+  </svg>`;
 }
 
 function escapeHtml(value) {
@@ -373,6 +552,13 @@ function isDayCompleteWithCache(date, dayKey, cache) {
 
 function isDaySkipped(date, dayKey) {
   return sessionStatus(getProgress(date, dayKey)) === 'skipped';
+}
+
+function didBecomeComplete(before, after) {
+  return before.total > 0
+    && before.done < before.total
+    && after.total > 0
+    && after.done === after.total;
 }
 
 // ── PAGE NAVIGATION ────────────────────────────────────────
@@ -446,6 +632,7 @@ function renderWorkout() {
     <div class="session-state${skipped ? ' skipped' : ''}">${skipped ? '今天已标记为主动跳过' : '如今天无法训练，可主动标记跳过'}</div>
     <button class="session-skip-btn" data-session-skip>${skipped ? '撤销跳过' : '跳过今日训练'}</button>
   </div>` : '';
+  html += `<div class="load-guidance"><strong>负重记录：</strong>杠铃填单侧杠铃片合计（不含杆）；哑铃填单只；器械/绳索填面板标示的已选重量（非 kg 先换算）；自重填 0kg。填写第1组重量后，会自动带入未修改的后续组；仍可逐组调整。编辑某组重量或次数后，该组不再跟随。</div>`;
   for (const sec of d.sections) {
     html += `<div class="section-block">
       <div class="section-label">
@@ -466,28 +653,20 @@ function renderWorkout() {
     } else if (sec.type === 'exercises') {
       for (const ex of sec.exercises) {
         const sets = prog[ex.id] || [];
-        const logs = readSetLogs(prog, ex.id, ex.sets);
-        const previous = priorExerciseSessions(ex.id, date, 1)[0] || null;
+        const previousLogs = priorExerciseSessions(ex.id, date, 1)[0]?.logs || [];
+        const logs = resolveSetDisplayRows(prog, ex.id, ex.sets, previousLogs);
         const countUnit = exerciseCountUnit(ex);
         const allDone = sets.filter(Boolean).length === ex.sets;
         html += `<div class="ex-card${allDone ? ' completed' : ''}" id="card_${ex.id}">
           <div class="ex-header">
             <div class="ex-name">${ex.name}</div>
-            <div class="ex-badge" style="color:${ex.badgeColor};background:${ex.badgeBg}">${ex.badge}</div>
+            <div class="ex-header-actions">
+              <div class="ex-badge" style="color:${ex.badgeColor};background:${ex.badgeBg}">${ex.badge}</div>
+              <button class="history-btn" type="button" title="显示历史数据" data-show-chart="${ex.id}">显示历史数据</button>
+            </div>
           </div>
           <div class="ex-tip">${ex.tip}</div>
           <div class="ex-meta">${ex.meta}</div>
-          <div class="last-performance">
-            <div class="last-performance-copy">
-              <strong>${previous ? `上次 ${previous.date.slice(5).replace('-', '/')}：` : '上次：'}</strong>
-              ${previous ? completedSetEntries(previous.logs).map(({ index, log }) =>
-                `第${index + 1}组 ${formatSetLog(log, countUnit)}`).join(' · ') : '暂无已完成组记录'}
-            </div>
-            <div class="ex-action-row">
-              ${previous ? `<button class="mini-btn" data-copy-last="${ex.id}">沿用上次</button>` : ''}
-              <button class="mini-btn" data-show-chart="${ex.id}">查看变化</button>
-            </div>
-          </div>
           <div class="set-log-head"><span>组</span><span>重量 kg</span><span>实际${countUnitLabel(countUnit)}</span><span>完成</span></div>
           <div class="set-log-list">`;
         for (let s = 0; s < ex.sets; s++) {
@@ -497,7 +676,10 @@ function renderWorkout() {
             <span class="set-number">${s + 1}</span>
             <input class="set-log-input" id="weight_${ex.id}_${s}" data-set-input="weight"
               data-ex-id="${ex.id}" data-set-idx="${s}" type="number" min="0" max="10000" step="0.5"
-              inputmode="decimal" value="${log?.weight ?? ''}" placeholder="0">
+              inputmode="decimal" value="${log?.weight ?? ''}"
+              data-weight-source="${log.weightSource}" data-weight-fallback="${log.fallbackWeight ?? ''}"
+              data-weight-fallback-source="${log.fallbackSource}"
+              data-autofill-eligible="${log.autoFillEligible ? 'true' : 'false'}">
             <input class="set-log-input" id="count_${ex.id}_${s}" data-set-input="actualCount"
               data-ex-id="${ex.id}" data-set-idx="${s}" type="number" min="1" max="9999" step="1"
               inputmode="numeric" value="${log?.actualCount ?? ''}" placeholder="${countUnit}">
@@ -525,8 +707,6 @@ function renderWorkout() {
     html += '</div>';
   }
   document.getElementById('workoutBody').innerHTML = html;
-  document.getElementById('completeBanner').classList.remove('show');
-  checkComplete();
 }
 
 async function toggleTodaySkip() {
@@ -543,92 +723,126 @@ async function toggleTodaySkip() {
   renderHome();
 }
 
-async function copyLastPerformance(exId) {
-  const ex = findExercise(exId);
-  const previous = priorExerciseSessions(exId, today(), 1)[0];
-  if (!ex || !previous) return;
-  const prog = ensureDayProgress(today(), currentDay);
-  const v2 = ensureV2(prog);
-  v2.setLogs[exId] = Array.from({ length: ex.sets }, (_, index) => {
-    const log = previous.logs[index];
-    if (!log) return null;
-    return { weight: log.weight, actualCount: log.actualCount };
-  });
-  const lastWeighted = [...v2.setLogs[exId]].reverse().find(log => log?.weight !== null);
-  if (lastWeighted) prog[weightKey(exId)] = lastWeighted.weight;
-  await dbPut('progress', { date: today(), data: progressCache[today()] });
-  renderWorkout();
-}
-
-function chartBars(items, valueKey, unit, colorClass) {
-  const max = Math.max(1, ...items.map(item => Number(item[valueKey]) || 0));
-  return `<div class="bar-chart">${items.map(item => {
-    const value = Number(item[valueKey]) || 0;
-    const height = Math.max(value > 0 ? 8 : 0, Math.round(value / max * 88));
-    return `<div class="bar-column">
-      <span class="bar-value">${Number.isInteger(value) ? value : value.toFixed(1)}${unit}</span>
-      <div class="bar ${colorClass}" style="height:${height}px"></div>
-      <span class="bar-label">${escapeHtml(item.label)}</span>
-    </div>`;
-  }).join('')}</div>`;
-}
-
 function showExerciseChart(exId) {
   const ex = findExercise(exId);
   if (!ex) return;
-  const countUnit = exerciseCountUnit(ex);
-  const copy = exerciseChartCopy(ex);
-  const current = readSetLogs(getProgress(today(), currentDay), exId, ex.sets)
-    .map((log, index) => ({
-      label: `${index + 1}组`, weight: log?.weight ?? 0, reps: log?.actualCount ?? 0, log
-    }));
-  const sessions = priorExerciseSessions(exId, today(), 6).reverse().map(session => ({
-    ...session, ...exerciseMetrics(session.logs), label: session.date.slice(5).replace('-', '/')
-  }));
-  const currentDetails = current.map(item => `<li>第${item.label}：${formatSetLog(item.log, countUnit)}</li>`).join('');
-  const sessionDetails = sessions.map(session => `<li><strong>${session.date}</strong>：${completedSetEntries(session.logs)
-    .map(({ index, log }) => `第${index + 1}组 ${formatSetLog(log, countUnit)}`).join(' · ')}<br><span>${formatTrainingSummary(session, countUnit)}</span></li>`).join('');
+  const now = new Date();
+  exerciseChartState = { exId, year: now.getFullYear(), month: now.getMonth() };
+  renderExerciseChart();
+  document.getElementById('chartModal').classList.add('on');
+}
+
+function renderExerciseChart() {
+  if (!exerciseChartState) return;
+  const { exId, year, month } = exerciseChartState;
+  const ex = findExercise(exId);
+  if (!ex) return;
+  const points = monthlyExerciseAverages(exId, year, month);
+  const now = new Date();
+  const atCurrentMonth = compareYearMonth(year, month, now.getFullYear(), now.getMonth()) >= 0;
+  const details = points.map(point => `<li>
+    <strong>${point.date}</strong>
+    <span>日均 ${formatChartWeight(point.average)}kg</span>
+    <span>完成组重量 ${point.weights.map(weight => `${formatChartWeight(weight)}kg`).join('、')}</span>
+  </li>`).join('');
   const modal = document.getElementById('chartModal');
   document.getElementById('chartModalBody').innerHTML = `
-    <div class="chart-modal-title">${escapeHtml(copy.title)}</div>
-    <div class="chart-section-title">本次各组</div>
-    <div class="chart-grid">
-      <div><div class="chart-metric">重量</div>${chartBars(current, 'weight', 'kg', 'weight-bar')}</div>
-      <div><div class="chart-metric">${countUnitLabel(countUnit)}</div>${chartBars(current, 'reps', countUnit, 'reps-bar')}</div>
+    <div class="chart-modal-title">${escapeHtml(ex.name)} · 月度平均重量</div>
+    <div class="month-chart-nav">
+      <button type="button" data-chart-month="-1" aria-label="上个月">‹</button>
+      <strong>${year}年${month + 1}月</strong>
+      <button type="button" data-chart-month="1" aria-label="下个月"${atCurrentMonth ? ' disabled' : ''}>›</button>
     </div>
-    <ul class="chart-details">${currentDetails || '<li>本次尚未记录</li>'}</ul>
-    <div class="chart-section-title">最近 6 次有完成组的训练</div>
-    ${sessions.length ? `<div class="chart-grid">
-      <div><div class="chart-metric">最高重量</div>${chartBars(sessions, 'maxWeight', 'kg', 'weight-bar')}</div>
-      <div><div class="chart-metric">总${countUnitLabel(countUnit)}</div>${chartBars(sessions, 'totalCount', countUnit, 'reps-bar')}</div>
-    </div><ul class="chart-details session-details">${sessionDetails}</ul>` : `<div class="chart-empty">${copy.empty}</div>`}`;
-  modal.classList.add('on');
+    ${points.length ? `${renderMonthlyAverageChart(points, year, month)}
+      <ul class="monthly-chart-details">${details}</ul>`
+      : '<div class="chart-empty">本月暂无已完成的重量记录</div>'}`;
+  modal.setAttribute('aria-label', `${ex.name}月度平均重量趋势图`);
+}
+
+function changeExerciseChartMonth(delta) {
+  if (!exerciseChartState || !Number.isInteger(delta) || Math.abs(delta) !== 1) return;
+  const next = shiftYearMonth(exerciseChartState.year, exerciseChartState.month, delta);
+  const now = new Date();
+  if (compareYearMonth(next.year, next.month, now.getFullYear(), now.getMonth()) > 0) return;
+  exerciseChartState = { ...exerciseChartState, ...next };
+  renderExerciseChart();
 }
 
 function closeExerciseChart() {
   document.getElementById('chartModal').classList.remove('on');
+  exerciseChartState = null;
 }
 
 async function toggleWarmup(id, el) {
   const date = today();
+  const before = calcProgress(date, currentDay);
   const prog = getProgress(date, currentDay);
   const done = !prog[id];
   await setItemDone(date, currentDay, id, done);
   await syncDayStatus(date, currentDay);
+  const after = calcProgress(date, currentDay);
+  const completedNow = didBecomeComplete(before, after);
   el.querySelector('.wi-check').className = 'wi-check' + (done ? ' done' : '');
   el.querySelector('.wi-text').className = 'wi-text' + (done ? ' done' : '');
-  if (done && settings.vibrate && navigator.vibrate) navigator.vibrate(30);
   updateProgress();
-  checkComplete();
+  if (done && completedNow) showCompletionDialog(date);
+  if (done && settings.vibrate && navigator.vibrate) {
+    navigator.vibrate(completedNow ? [50, 50, 50, 50, 200] : 30);
+  }
 }
 
 function readSetInput(exId, setIdx) {
   const weightInput = document.getElementById(`weight_${exId}_${setIdx}`);
   const countInput = document.getElementById(`count_${exId}_${setIdx}`);
-  const weight = Number(weightInput?.value);
-  const actualCount = Number(countInput?.value);
+  const weightRaw = weightInput?.value.trim() || '';
+  const countRaw = countInput?.value.trim() || '';
+  const weight = weightRaw === '' ? null : Number(weightRaw);
+  const actualCount = countRaw === '' ? null : Number(countRaw);
   const log = normalizeSetLog({ weight, actualCount });
-  return { log, weightInput, countInput };
+  return { log, weightInput, countInput, weightRaw, countRaw };
+}
+
+function markSetTouchedForInteraction(input, eventType) {
+  if (eventType !== 'input' && eventType !== 'change') return false;
+  const row = input?.closest('.set-log-row');
+  if (!row) return false;
+  row.dataset.setTouched = 'true';
+  return true;
+}
+
+function applyFirstSetWeightAutofill(exId) {
+  const firstInput = document.getElementById(`weight_${exId}_0`);
+  if (!firstInput) return;
+  const firstWeightRaw = firstInput.validity?.badInput ? 'invalid' : firstInput.value;
+  const prog = getProgress(today(), currentDay);
+  const completed = Array.isArray(prog[exId]) ? prog[exId] : [];
+  document.querySelectorAll(`input[data-set-input="weight"][data-ex-id="${exId}"]`).forEach(input => {
+    const setIdx = Number(input.dataset.setIdx);
+    if (setIdx === 0) return;
+    const row = input.closest('.set-log-row');
+    const fallbackRaw = input.dataset.weightFallback ?? '';
+    const state = {
+      value: input.value === '' ? null : Number(input.value),
+      source: input.dataset.weightSource || 'blank',
+      fallbackValue: fallbackRaw === '' ? null : Number(fallbackRaw),
+      fallbackSource: input.dataset.weightFallbackSource || 'blank',
+      autoFillEligible: input.dataset.autofillEligible === 'true',
+      touched: row?.dataset.setTouched === 'true',
+      completed: !!completed[setIdx]
+    };
+    const next = nextAutofillWeightState(state, firstWeightRaw);
+    if (next.value !== state.value || next.source !== state.source) {
+      input.value = next.value ?? '';
+      input.dataset.weightSource = next.source;
+    }
+  });
+}
+
+function markSetInputAuthoritative(exId, setIdx) {
+  const weightInput = document.getElementById(`weight_${exId}_${setIdx}`);
+  if (!weightInput) return;
+  weightInput.dataset.weightSource = 'current-v2';
+  weightInput.dataset.autofillEligible = 'false';
 }
 
 function showSetInputError(exId, setIdx, message, inputs = []) {
@@ -640,6 +854,7 @@ function showSetInputError(exId, setIdx, message, inputs = []) {
 
 async function toggleSet(exId, setIdx, label) {
   const date = today();
+  const before = calcProgress(date, currentDay);
   const prog = getProgress(date, currentDay);
   const sets = prog[exId] || [];
   const done = !sets[setIdx];
@@ -661,39 +876,52 @@ async function toggleSet(exId, setIdx, label) {
         : [values.weightInput, values.countInput]);
       return;
     }
+    if (setIdx === 0) applyFirstSetWeightAutofill(exId);
   }
   await setSetLogAndDone(date, currentDay, exId, setIdx, log, done);
+  if (done) markSetInputAuthoritative(exId, setIdx);
   await syncDayStatus(date, currentDay);
+  const after = calcProgress(date, currentDay);
+  const completedNow = didBecomeComplete(before, after);
   const btn = document.getElementById(`set_${exId}_${setIdx}`);
   btn.className = 'set-btn' + (done ? ' done' : '');
   const error = document.getElementById(`set_error_${exId}_${setIdx}`);
   if (error) error.textContent = '';
   if (done) {
-    if (settings.vibrate && navigator.vibrate) navigator.vibrate([40, 20, 40]);
     const updatedSets = getProgress(date, currentDay)[exId] || [];
     const doneCount = updatedSets.filter(Boolean).length;
     const ex = PLAN[currentDay].sections.flatMap(s => s.exercises || []).find(e => e.id === exId);
     if (ex && doneCount === ex.sets) {
       document.getElementById('card_' + exId).classList.add('completed');
     }
-    const restSeconds = effectiveRestTime(settings, 0);
-    if (settings.autoTimer && restSeconds > 0) startTimer(restSeconds, label);
+    if (completedNow) {
+      showCompletionDialog(date);
+      if (settings.vibrate && navigator.vibrate) navigator.vibrate([50, 50, 50, 50, 200]);
+    } else {
+      if (settings.vibrate && navigator.vibrate) navigator.vibrate([40, 20, 40]);
+      const restSeconds = effectiveRestTime(settings, 0);
+      if (settings.autoTimer && restSeconds > 0) startTimer(restSeconds, label);
+    }
   }
   updateProgress();
-  checkComplete();
 }
 
 async function toggleCardio(cid, el) {
   const date = today();
+  const before = calcProgress(date, currentDay);
   const prog = getProgress(date, currentDay);
   const done = !prog[cid];
   await setItemDone(date, currentDay, cid, done);
   await syncDayStatus(date, currentDay);
+  const after = calcProgress(date, currentDay);
+  const completedNow = didBecomeComplete(before, after);
   const card = el.closest('.cardio-card');
   card.querySelector('.big-check').className = 'big-check' + (done ? ' done' : '');
-  if (done && settings.vibrate && navigator.vibrate) navigator.vibrate([40, 30, 40, 30, 80]);
   updateProgress();
-  checkComplete();
+  if (done && completedNow) showCompletionDialog(date);
+  if (done && settings.vibrate && navigator.vibrate) {
+    navigator.vibrate(completedNow ? [50, 50, 50, 50, 200] : [40, 30, 40, 30, 80]);
+  }
 }
 
 async function syncDayStatus(date, dayKey) {
@@ -711,17 +939,25 @@ function updateProgress() {
   document.getElementById('progText').textContent = `${done} / ${total} 项完成（${pct}%）`;
 }
 
-function checkComplete() {
-  const { done, total } = calcProgress(today(), currentDay);
-  const banner = document.getElementById('completeBanner');
-  if (done === total && total > 0) {
-    const d = PLAN[currentDay];
-    document.getElementById('completeSub').textContent = `${d.label} ${d.title}全部完成`;
-    banner.classList.add('show');
-    if (settings.vibrate && navigator.vibrate) navigator.vibrate([50, 50, 50, 50, 200]);
-  } else {
-    banner.classList.remove('show');
-  }
+function showCompletionDialog(dateKey = today()) {
+  const dialog = document.getElementById('completionDialog');
+  if (!dialog || dialog.open) return;
+  completionReturnFocus = document.activeElement;
+  const date = document.getElementById('completionDate');
+  date.dateTime = dateKey;
+  date.textContent = formatLocalChineseDate(dateKey);
+  dialog.showModal();
+  document.getElementById('completionClose')?.focus();
+}
+
+function closeCompletionDialog() {
+  const dialog = document.getElementById('completionDialog');
+  if (dialog?.open) dialog.close();
+}
+
+function restoreCompletionFocus() {
+  if (completionReturnFocus?.isConnected) completionReturnFocus.focus();
+  completionReturnFocus = null;
 }
 
 // ── TIMER ──────────────────────────────────────────────────
@@ -1261,11 +1497,6 @@ async function init() {
       toggleTodaySkip();
       return;
     }
-    const copyButton = e.target.closest('[data-copy-last]');
-    if (copyButton) {
-      copyLastPerformance(copyButton.dataset.copyLast);
-      return;
-    }
     const chartButton = e.target.closest('[data-show-chart]');
     if (chartButton) {
       showExerciseChart(chartButton.dataset.showChart);
@@ -1288,14 +1519,26 @@ async function init() {
     }
   });
 
+  document.getElementById('workoutBody').addEventListener('input', e => {
+    const input = e.target.closest('[data-set-input]');
+    if (!input) return;
+    markSetTouchedForInteraction(input, e.type);
+    if (input.dataset.setInput === 'weight' && Number(input.dataset.setIdx) === 0) {
+      applyFirstSetWeightAutofill(input.dataset.exId);
+    }
+  });
+
   document.getElementById('workoutBody').addEventListener('change', async e => {
     const input = e.target.closest('[data-set-input]');
     if (!input) return;
+    markSetTouchedForInteraction(input, e.type);
     const exId = input.dataset.exId;
     const setIdx = Number(input.dataset.setIdx);
+    if (input.dataset.setInput === 'weight' && setIdx === 0) {
+      applyFirstSetWeightAutofill(exId);
+    }
     const values = readSetInput(exId, setIdx);
-    const weightRaw = values.weightInput?.value.trim() || '';
-    const countRaw = values.countInput?.value.trim() || '';
+    const { weightRaw, countRaw } = values;
     const draft = normalizeSetLog({
       weight: weightRaw === '' ? null : Number(weightRaw),
       actualCount: countRaw === '' ? null : Number(countRaw)
@@ -1311,6 +1554,7 @@ async function init() {
     if (error) error.textContent = '';
     if (draft) {
       await setSetLogDraft(today(), currentDay, exId, setIdx, draft);
+      markSetInputAuthoritative(exId, setIdx);
     } else {
       const prog = getProgress(today(), currentDay);
       const logs = ensureV2(prog).setLogs[exId];
@@ -1327,7 +1571,18 @@ async function init() {
 
   document.getElementById('chartModal').addEventListener('click', e => {
     if (e.target.id === 'chartModal') closeExerciseChart();
+    const monthButton = e.target.closest('[data-chart-month]');
+    if (monthButton && !monthButton.disabled) {
+      changeExerciseChartMonth(Number(monthButton.dataset.chartMonth));
+    }
   });
+
+  const completionDialog = document.getElementById('completionDialog');
+  document.getElementById('completionClose').addEventListener('click', closeCompletionDialog);
+  completionDialog.addEventListener('click', e => {
+    if (e.target === completionDialog) closeCompletionDialog();
+  });
+  completionDialog.addEventListener('close', restoreCompletionFocus);
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') reconcileTimer();
@@ -1345,21 +1600,32 @@ if (typeof document !== 'undefined') init();
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     localDateKey,
+    formatLocalChineseDate,
     dateFromLocalKey,
     remainingSeconds,
     readExerciseWeight,
     hasRequiredWeight,
     readSetLogs,
+    resolveSetDisplayRows,
+    resolveSetDisplayValues,
+    classifyFirstSetWeight,
+    nextAutofillWeightState,
+    markSetTouchedForInteraction,
     normalizeSetLog,
     sessionStatus,
     effectiveRestTime,
-    exerciseMetrics,
     exerciseCountUnit,
     countUnitLabel,
     formatSetLog,
-    formatTrainingSummary,
-    exerciseChartCopy,
     priorExerciseSessions,
+    normalizeYearMonth,
+    shiftYearMonth,
+    compareYearMonth,
+    daysInMonth,
+    formatChartWeight,
+    monthlyExerciseAverages,
+    monthlyChartModel,
+    didBecomeComplete,
     calculateScheduledStreak,
     validateBackupObject,
     currentBackupPayload,
