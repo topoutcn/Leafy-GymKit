@@ -1,4 +1,4 @@
-const CACHE_NAME = 'gymkit-v4';
+const CACHE_NAME = 'gymkit-v6';
 const ASSETS = [
   './',
   './index.html',

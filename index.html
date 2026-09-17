@@ -34,6 +34,14 @@
   </div>
 </div>
 
+<!-- Exercise progress chart -->
+<div class="chart-modal" id="chartModal" role="dialog" aria-modal="true" aria-label="动作变化图">
+  <div class="chart-modal-box">
+    <button class="chart-close" type="button" onclick="closeExerciseChart()" aria-label="关闭">×</button>
+    <div id="chartModalBody"></div>
+  </div>
+</div>
+
 <!-- Pages -->
 <div class="page on" id="page-home">
   <div class="page-header">
@@ -112,6 +120,13 @@
         <div class="sr-val" id="totalDaysVal"></div>
       </div>
     </div>
+    <div class="data-actions">
+      <button class="data-btn" type="button" onclick="exportBackup()">导出 JSON 备份</button>
+      <button class="data-btn" type="button" onclick="document.getElementById('backupFile').click()">从 JSON 恢复</button>
+      <button class="data-btn secondary" type="button" onclick="undoLastImport()">撤销上次导入</button>
+    </div>
+    <input id="backupFile" type="file" accept="application/json,.json" hidden>
+    <div class="data-notice" id="dataNotice" role="status"></div>
     <button class="danger-btn" onclick="clearData()">清除所有训练记录</button>
     <div style="text-align:center;font-size:10px;color:var(--text3);margin-top:20px;line-height:1.8;">
       数据存储在本机设备中<br>使用 IndexedDB，不会被轻易清除
